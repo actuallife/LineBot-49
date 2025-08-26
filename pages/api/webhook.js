@@ -190,7 +190,7 @@ export default async function handler(req, res) {
       if (isText && isCmd(cmd, ["/a","a"])) {
         const all   = await getAllMembers(chatId);
         const names = all.map(m => m.displayName).sort((a,b)=>a.localeCompare(b,"zh-Hant"));
-        const title = `[${todayKey()}] 全部名單（${names.length}人）`;
+        const title = `已登錄的名單（${names.length}人）`;
         const blocks = chunk([title, ...names]);
         await reply(e.replyToken, { type: "text", text: blocks[0] });
         if (blocks.length > 1) await push(chatId, blocks.slice(1));
