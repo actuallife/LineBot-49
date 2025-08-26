@@ -16,10 +16,7 @@ async function replyMessage(replyToken, messages) {
   const payload = Array.isArray(messages) ? { replyToken, messages } : { replyToken, messages: [messages] };
   await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${ACCESS_TOKEN}`,
-      "Content-Type": "application/json"
-    },
+    headers: { "Authorization": `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
     body: JSON.stringify(payload)
   });
 }
@@ -28,20 +25,13 @@ async function pushMessages(to, texts) {
   if (!texts.length) return;
   await fetch("https://api.line.me/v2/bot/message/push", {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${ACCESS_TOKEN}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      to,
-      messages: texts.map(t => ({ type: "text", text: t }))
-    })
+    headers: { "Authorization": `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ to, messages: texts.map(t => ({ type: "text", text: t })) })
   });
 }
 
 async function fetchAllMemberIds(groupId) {
-  const ids = [];
-  let start = "";
+  const ids = []; let start = "";
   while (true) {
     const url = new URL(`https://api.line.me/v2/bot/group/${groupId}/members/ids`);
     if (start) url.searchParams.set("start", start);
@@ -65,42 +55,30 @@ async function fetchDisplayName(groupId, userId) {
 }
 
 function chunkByLimit(lines, limit = 4500) {
-  const chunks = [];
-  let buf = "";
+  const chunks = []; let buf = "";
   for (const line of lines) {
     const add = (buf ? "\n" : "") + line;
-    if ((buf + add).length > limit) {
-      if (buf) chunks.push(buf);
-      buf = line;
-    } else {
-      buf += add;
-    }
+    if ((buf + add).length > limit) { if (buf) chunks.push(buf); buf = line; } else { buf += add; }
   }
   if (buf) chunks.push(buf);
   return chunks;
 }
 
 export default async function handler(req, res) {
-  // 讓 LINE Console 的 Verify/瀏覽器健康檢查通過
-  if (req.method === "GET") return res.status(200).send("ok");
+  // 讓 Verify/健康檢查通過
+  if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") {
+    return res.status(200).send("ok");
+  }
   if (req.method !== "POST") return res.status(405).end();
 
   let raw;
-  try {
-    raw = await getRawBody(req);
-  } catch {
-    return res.status(400).end("Bad Request");
-  }
+  try { raw = await getRawBody(req); } catch { return res.status(400).end("Bad Request"); }
 
   const signature = req.headers["x-line-signature"] || "";
   if (!isValidSignature(raw, signature)) return res.status(403).end("Forbidden");
 
   let body;
-  try {
-    body = JSON.parse(raw.toString("utf8"));
-  } catch {
-    return res.status(400).end("Bad Request");
-  }
+  try { body = JSON.parse(raw.toString("utf8")); } catch { return res.status(400).end("Bad Request"); }
 
   try {
     await Promise.all((body.events || []).map(async (e) => {
@@ -111,17 +89,12 @@ export default async function handler(req, res) {
 
       if (text === "/s") {
         const memberIds = await fetchAllMemberIds(groupId);
-
         const names = [];
-        for (const uid of memberIds) {
-          const name = await fetchDisplayName(groupId, uid);
-          names.push(name || uid);
-        }
+        for (const uid of memberIds) names.push((await fetchDisplayName(groupId, uid)) || uid);
 
         const chunks = chunkByLimit(names);
-        if (!chunks.length) {
-          await replyMessage(e.replyToken, { type: "text", text: "沒有成員資料可顯示。" });
-        } else {
+        if (!chunks.length) await replyMessage(e.replyToken, { type: "text", text: "沒有成員資料可顯示。" });
+        else {
           await replyMessage(e.replyToken, { type: "text", text: chunks[0] });
           if (chunks.length > 1) await pushMessages(groupId, chunks.slice(1));
         }
@@ -129,7 +102,6 @@ export default async function handler(req, res) {
     }));
   } catch (err) {
     console.error(err);
-    // 仍回 200，避免 LINE 過度重送
   }
 
   res.status(200).json({ ok: true });
