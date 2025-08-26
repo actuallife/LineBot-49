@@ -69,6 +69,7 @@ export default async function handler(req, res) {
 
   try {
     await Promise.all((body.events||[]).map(async (e)=>{
+      console.log("event", e.type, "source=", e.source?.type, "gid=", e.source?.groupId, "rid=", e.source?.roomId, "text=", e.message?.text);
       if (e.type !== "message") return;
 
       const srcType = e.source?.type;                  // user | group | room
