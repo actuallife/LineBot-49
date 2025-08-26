@@ -1,3 +1,4 @@
+// pages/api/webhook.js
 import getRawBody from "raw-body";
 import crypto from "crypto";
 
@@ -80,13 +81,26 @@ function chunkByLimit(lines, limit = 4500) {
 }
 
 export default async function handler(req, res) {
+  // 讓 LINE Console 的 Verify/瀏覽器健康檢查通過
+  if (req.method === "GET") return res.status(200).send("ok");
   if (req.method !== "POST") return res.status(405).end();
 
-  const raw = await getRawBody(req);
+  let raw;
+  try {
+    raw = await getRawBody(req);
+  } catch {
+    return res.status(400).end("Bad Request");
+  }
+
   const signature = req.headers["x-line-signature"] || "";
   if (!isValidSignature(raw, signature)) return res.status(403).end("Forbidden");
 
-  const body = JSON.parse(raw.toString("utf8"));
+  let body;
+  try {
+    body = JSON.parse(raw.toString("utf8"));
+  } catch {
+    return res.status(400).end("Bad Request");
+  }
 
   try {
     await Promise.all((body.events || []).map(async (e) => {
@@ -98,7 +112,6 @@ export default async function handler(req, res) {
       if (text === "/s") {
         const memberIds = await fetchAllMemberIds(groupId);
 
-        // 逐一取名稱；如群很大，可加快取或併發限制
         const names = [];
         for (const uid of memberIds) {
           const name = await fetchDisplayName(groupId, uid);
@@ -116,6 +129,7 @@ export default async function handler(req, res) {
     }));
   } catch (err) {
     console.error(err);
+    // 仍回 200，避免 LINE 過度重送
   }
 
   res.status(200).json({ ok: true });
