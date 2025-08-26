@@ -1,114 +1,103 @@
+// pages/api/webhook.js
 import getRawBody from "raw-body";
 import crypto from "crypto";
-
 export const config = { api: { bodyParser: false } };
 
-// LINE env
+// ===== Env =====
 const SECRET = process.env.LINE_CHANNEL_SECRET;
 const TOKEN  = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-
-// 可選：Upstash Redis（建議）
-// 在 Vercel 設下：UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
 const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL || "";
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 
-// ===== 簽章驗證 =====
+// ===== Helpers =====
 function validSig(raw, sig) {
   const mac = crypto.createHmac("sha256", SECRET).update(raw).digest("base64");
   return mac === sig;
 }
+function todayKey(tz = "Asia/Taipei") {
+  const d = new Date();
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" }).formatToParts(d);
+  const y = parts.find(p=>p.type==="year").value;
+  const m = parts.find(p=>p.type==="month").value;
+  const da= parts.find(p=>p.type==="day").value;
+  return `${y}-${m}-${da}`; // YYYY-MM-DD
+}
+function chunk(lines, limit = 4500) {
+  const out=[]; let buf="";
+  for (const line of lines) { const add=(buf?"\n":"")+line; if ((buf+add).length>limit){ if(buf) out.push(buf); buf=line; } else buf+=add; }
+  if (buf) out.push(buf); return out;
+}
 
-// ===== LINE API 呼叫 =====
-async function call(endpoint, init = {}) {
+// ===== LINE API =====
+async function call(endpoint, init={}) {
   return fetch(`https://api.line.me${endpoint}`, {
     ...init,
-    headers: {
-      Authorization: `Bearer ${TOKEN}`,
-      "Content-Type": "application/json",
-      ...(init.headers || {}),
-    },
+    headers: { Authorization:`Bearer ${TOKEN}`, "Content-Type":"application/json", ...(init.headers||{}) }
   });
 }
 async function reply(replyToken, messages) {
-  const payload = Array.isArray(messages) ? { replyToken, messages } : { replyToken, messages: [messages] };
-  await call("/v2/bot/message/reply", { method: "POST", body: JSON.stringify(payload) });
+  const payload = Array.isArray(messages) ? { replyToken, messages } : { replyToken, messages:[messages] };
+  await call("/v2/bot/message/reply", { method:"POST", body: JSON.stringify(payload) });
 }
 async function push(to, texts) {
   if (!texts.length) return;
-  await call("/v2/bot/message/push", {
-    method: "POST",
-    body: JSON.stringify({ to, messages: texts.map(t => ({ type: "text", text: t })) }),
-  });
+  await call("/v2/bot/message/push", { method:"POST", body: JSON.stringify({ to, messages:texts.map(t=>({type:"text", text:t})) }) });
 }
 async function getProfile(srcType, chatId, userId) {
-  const base = srcType === "group" ? `/v2/bot/group/${chatId}` : `/v2/bot/room/${chatId}`;
-  const r = await call(`${base}/member/${userId}`, { method: "GET", headers: { "Content-Type": undefined } });
+  const base = srcType==="group" ? `/v2/bot/group/${chatId}` : `/v2/bot/room/${chatId}`;
+  const r = await call(`${base}/member/${userId}`, { method:"GET", headers:{ "Content-Type": undefined } });
   if (!r.ok) return null;
   const j = await r.json();
   return { userId, displayName: j.displayName || userId };
 }
+async function membersCount(srcType, chatId) {
+  const base = srcType==="group" ? `/v2/bot/group/${chatId}` : `/v2/bot/room/${chatId}`;
+  const r = await call(`${base}/members/count`, { method:"GET", headers:{ "Content-Type": undefined } });
+  if (!r.ok) return null; const j = await r.json(); return j.count ?? null;
+}
 
-// ===== 名單儲存層：Redis（優先）或記憶體 =====
-const mem = new Map(); // chatId -> Map<userId, name>
-
-async function redisCmd(command) {
+// ===== Storage: Redis (preferred) or in-memory =====
+const mem = { members:new Map(), done:new Map() }; // members: chatId->Map<uid,name>; done: chatId->Map<date,Set<uid>>
+async function redisExec(command) {
   if (!REDIS_URL || !REDIS_TOKEN) throw new Error("no-redis");
   const r = await fetch(REDIS_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ command }),
+    method:"POST", headers:{ Authorization:`Bearer ${REDIS_TOKEN}`, "Content-Type":"application/json" },
+    body: JSON.stringify({ command })
   });
   if (!r.ok) throw new Error(`redis ${r.status}`);
-  return r.json(); // { result, error? }
+  return r.json(); // {result}
 }
-function keyOf(chatId) { return `group:${chatId}:members`; }
+const keyMembers = (chatId)=>`group:${chatId}:members`;      // HASH uid->name
+const keyDone    = (chatId,date)=>`group:${chatId}:done:${date}`; // SET of uid
 
-// 儲存或更新成員名稱
-async function saveMember(chatId, userId, name) {
-  try {
-    await redisCmd(["HSET", keyOf(chatId), userId, name]);
-  } catch {
-    let m = mem.get(chatId); if (!m) { m = new Map(); mem.set(chatId, m); }
-    m.set(userId, name);
-  }
+async function saveMember(chatId, uid, name) {
+  try { await redisExec(["HSET", keyMembers(chatId), uid, name]); }
+  catch { let m=mem.members.get(chatId); if(!m){m=new Map(); mem.members.set(chatId,m);} m.set(uid,name); }
 }
-// 移除成員
-async function removeMember(chatId, userId) {
-  try { await redisCmd(["HDEL", keyOf(chatId), userId]); }
-  catch {
-    const m = mem.get(chatId); if (m) m.delete(userId);
-  }
-}
-// 讀取全部成員（物件陣列）
 async function getAllMembers(chatId) {
   try {
-    const j = await redisCmd(["HGETALL", keyOf(chatId)]);
-    const arr = j.result || []; // [field,value,field,value,...]
-    const out = [];
-    for (let i = 0; i < arr.length; i += 2) out.push({ userId: arr[i], displayName: arr[i + 1] });
+    const j = await redisExec(["HGETALL", keyMembers(chatId)]);
+    const arr = j.result || []; const out=[];
+    for (let i=0;i<arr.length;i+=2) out.push({ userId:arr[i], displayName:arr[i+1] });
     return out;
   } catch {
-    const m = mem.get(chatId) || new Map();
+    const m = mem.members.get(chatId) || new Map();
     return Array.from(m, ([userId, displayName]) => ({ userId, displayName }));
   }
 }
-
-// ===== 文字分段（避免 5000 字上限） =====
-function chunk(lines, limit = 4500) {
-  const out = []; let buf = "";
-  for (const line of lines) {
-    const add = (buf ? "\n" : "") + line;
-    if ((buf + add).length > limit) { if (buf) out.push(buf); buf = line; } else buf += add;
-  }
-  if (buf) out.push(buf);
-  return out;
+async function markDone(chatId, dateKey, uid) {
+  try { await redisExec(["SADD", keyDone(chatId,dateKey), uid]); }
+  catch { let d=mem.done.get(chatId); if(!d){d=new Map(); mem.done.set(chatId,d);} let s=d.get(dateKey); if(!s){s=new Set(); d.set(dateKey,s);} s.add(uid); }
+}
+async function getDoneUids(chatId, dateKey) {
+  try { const j = await redisExec(["SMEMBERS", keyDone(chatId,dateKey)]); return j.result || []; }
+  catch { const d=mem.done.get(chatId); const s=d?.get(dateKey); return s?Array.from(s):[]; }
 }
 
-// ===== 主處理器 =====
+// ===== Handler =====
 export default async function handler(req, res) {
-  // 健康檢查與 Verify
-  if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return res.status(200).send("ok");
-  if (req.method !== "POST") return res.status(405).end();
+  if (req.method==="GET" || req.method==="HEAD" || req.method==="OPTIONS") return res.status(200).send("ok");
+  if (req.method!=="POST") return res.status(405).end();
 
   let raw; try { raw = await getRawBody(req); } catch { return res.status(400).end("Bad Request"); }
   const sig = req.headers["x-line-signature"] || "";
@@ -117,73 +106,86 @@ export default async function handler(req, res) {
   let body; try { body = JSON.parse(raw.toString("utf8")); } catch { return res.status(400).end("Bad Request"); }
 
   try {
-    await Promise.all((body.events || []).map(async (e) => {
+    await Promise.all((body.events||[]).map(async (e)=>{
       const type = e.type;
       const srcType = e.source?.type; // user | group | room
-      const chatId = e.source?.groupId || e.source?.roomId;
-      const isText = type === "message" && e.message?.type === "text";
-      const text = isText ? (e.message.text || "").trim() : "";
+      const chatId  = e.source?.groupId || e.source?.roomId;
+      const uid     = e.source?.userId;
+      const isText  = type==="message" && e.message?.type==="text";
+      const text    = isText ? (e.message.text||"").trim() : "";
 
-      // 只處理 group/room；私聊不記錄名單
-      if (srcType !== "group" && srcType !== "room") {
-        if (isText && text === "/s") await reply(e.replyToken, { type: "text", text: "請在群組使用 /s。" });
+      if (srcType!=="group" && srcType!=="room") {
+        if (isText && (text==="/d" || text==="/s")) await reply(e.replyToken,{type:"text",text:"請在群組使用指令。"});
         return;
       }
 
-      // 有人發言 → 抓他的 displayName 並登錄
-      if (isText && e.source?.userId) {
-        const prof = await getProfile(srcType, chatId, e.source.userId);
+      // 每次發話/加入都嘗試登錄名稱
+      if (uid && (isText || type==="memberJoined")) {
+        const prof = await getProfile(srcType, chatId, uid).catch(()=>null);
         if (prof) await saveMember(chatId, prof.userId, prof.displayName);
       }
-
-      // 成員加入事件 → 批次登錄
-      if (type === "memberJoined" && Array.isArray(e.joined?.members)) {
-        for (const m of e.joined.members) {
-          if (!m.userId) continue;
-          const prof = await getProfile(srcType, chatId, m.userId);
-          if (prof) await saveMember(chatId, prof.userId, prof.displayName);
+      if (type==="memberJoined" && Array.isArray(e.joined?.members)) {
+        for (const m of e.joined.members) if (m.userId) {
+          const p = await getProfile(srcType, chatId, m.userId).catch(()=>null);
+          if (p) await saveMember(chatId, p.userId, p.displayName);
         }
-        // 可回覆歡迎詞（選用）
+      }
+      if (type==="memberLeft" && Array.isArray(e.left?.members)) {
+        // 可選：不強制刪除，保留名單以便統計
       }
 
-      // 成員離開事件 → 從名單移除
-      if (type === "memberLeft" && Array.isArray(e.left?.members)) {
-        for (const m of e.left.members) if (m.userId) await removeMember(chatId, m.userId);
-      }
-
-      // 指令：/reg 手動登錄自己
-      if (isText && text === "/reg" && e.source?.userId) {
-        const prof = await getProfile(srcType, chatId, e.source.userId);
-        if (prof) { await saveMember(chatId, prof.userId, prof.displayName); await reply(e.replyToken, { type: "text", text: "已登錄。" }); }
-        else { await reply(e.replyToken, { type: "text", text: "無法取得你的資料。" }); }
+      // ===== /reg 登錄自己 =====
+      if (isText && text==="/reg" && uid) {
+        const p = await getProfile(srcType, chatId, uid).catch(()=>null);
+        if (p) { await saveMember(chatId, p.userId, p.displayName); await reply(e.replyToken,{type:"text",text:"已登錄。"}); }
+        else { await reply(e.replyToken,{type:"text",text:"無法取得你的資料。"}); }
         return;
       }
 
-      // 指令：/s 列出目前已蒐集到的名單
-      if (isText && text === "/s") {
-        try {
-          const members = await getAllMembers(chatId);
-          if (!members.length) {
-            await reply(e.replyToken, { type: "text", text: "名單尚空。請成員任意發言或輸入 /reg 完成登錄。" });
-            return;
-          }
-          // 依顯示名稱排序
-          const names = members.map(m => m.displayName).sort((a, b) => a.localeCompare(b, "zh-Hant"));
-          const blocks = chunk(names);
-          await reply(e.replyToken, { type: "text", text: blocks[0] });
-          if (blocks.length > 1) await push(chatId, blocks.slice(1));
-        } catch (err) {
-          await reply(e.replyToken, { type: "text", text: "名單讀取失敗。" });
-        }
+      // ===== /d 今日完成 =====
+      if (isText && text==="/d" && uid) {
+        const date = todayKey();
+        const p = await getProfile(srcType, chatId, uid).catch(()=>null);
+        if (p) await saveMember(chatId, p.userId, p.displayName);
+        await markDone(chatId, date, uid);
+        await reply(e.replyToken, { type:"text", text:`已記錄：${date}` });
         return;
       }
 
-      // 其他訊息：可選擇不回覆；若要健康回覆，解除下行註解
-      // if (isText) await reply(e.replyToken, { type: "text", text: "bot online" });
+      // ===== /s 狀態清單 =====
+      if (isText && text==="/s") {
+        const date = todayKey();
+        const [all, doneUids, totalCnt] = await Promise.all([
+          getAllMembers(chatId),
+          getDoneUids(chatId, date),
+          membersCount(srcType, chatId)
+        ]);
+        const nameById = new Map(all.map(m=>[m.userId, m.displayName]));
+        const done = []; const undone = [];
+        // 以已知名單為基準
+        for (const [id, name] of nameById.entries()) {
+          (doneUids.includes(id) ? done : undone).push(name || id);
+        }
+        done.sort((a,b)=>a.localeCompare(b,"zh-Hant"));
+        undone.sort((a,b)=>a.localeCompare(b,"zh-Hant"));
+
+        const title = `[${date}] 定課狀態：已完成 ${done.length}/${totalCnt ?? (done.length+undone.length)}`;
+        const blocks = [];
+        blocks.push(`${title}\n— 已完成（${done.length}）\n${done.length?done.join("\n"):"（無）"}`);
+        blocks.push(`— 未完成（${undone.length}）\n${undone.length?undone.join("\n"):"（無）"}`);
+
+        const parts = [];
+        for (const b of blocks) parts.push(...chunk(b.split("\n")));
+
+        await reply(e.replyToken, { type:"text", text: parts[0] });
+        if (parts.length>1) await push(chatId, parts.slice(1));
+        return;
+      }
+
+      // 其他訊息：不回覆
     }));
   } catch (err) {
     console.error(err);
   }
-
-  return res.status(200).json({ ok: true });
+  return res.status(200).json({ ok:true });
 }
