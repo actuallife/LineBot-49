@@ -36,6 +36,23 @@ function chunk(lines, limit = 4500) {
   for (const line of lines) { const add=(buf?"\n":"")+line; if ((buf+add).length>limit){ if(buf) out.push(buf); buf=line; } else buf+=add; }
   if (buf) out.push(buf); return out;
 }
+function fmtKey(d, tz="Asia/Taipei") {
+  const p = new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(d);
+  const y=p.find(x=>x.type==="year").value, m=p.find(x=>x.type==="month").value, da=p.find(x=>x.type==="day").value;
+  return `${y}-${m}-${da}`;
+}
+function lastNDates(n, tz="Asia/Taipei"){
+  const out=[]; const now=new Date();
+  for(let i=0;i<n;i++){ out.push(fmtKey(new Date(now.getTime()-i*86400000), tz)); }
+  return out.reverse();
+}
+function monthDates(ym, tz="Asia/Taipei"){ // ym: "YYYY-MM"
+  const [Y,M]=ym.split("-").map(Number);
+  const first = new Date(Date.UTC(Y, M-1, 1));
+  const next  = new Date(Date.UTC(Y, M,   1));
+  const out=[]; for(let d=new Date(first); d<next; d.setUTCDate(d.getUTCDate()+1)) out.push(fmtKey(new Date(d), tz));
+  return out;
+}
 
 // ===== LINE API =====
 async function call(endpoint, init={}) {
@@ -206,22 +223,98 @@ export default async function handler(req, res) {
         if (blocks.length > 1) await push(chatId, blocks.slice(1));
         return;
       }
+      // ===== /stats 區間統計：/stats 7 或 /stats 2025-08 =====
+      if (isText && (cmd.startsWith("/stats") || cmd === "stats")) {
+        // 參數（保留原始空白作解析）
+        const rawNorm = toHalfWidth(rawText).trim();
+        const arg = rawNorm.slice(6).trim(); // 去掉 "/stats"
+        let dates = [];
+        if (/^\d+$/.test(arg) && Number(arg) > 0) {
+          dates = lastNDates(Math.min(Number(arg), 90)); // 上限 90 天
+        } else if (/^\d{4}-\d{2}$/.test(arg)) {
+          dates = monthDates(arg);
+        } else {
+          dates = lastNDates(7);
+        }
+      
+        // 成員名單與每日完成
+        const allMembers = await getAllMembers(chatId);
+        const nameById = new Map(allMembers.map(m => [m.userId, m.displayName]));
+        const totalMembers = nameById.size;
+      
+        const perDayDone = [];
+        for (const d of dates) {
+          const uids = await getDoneUids(chatId, d); // Set of userId 當天完成
+          perDayDone.push({ date: d, set: new Set(uids) });
+        }
+      
+        // 指標
+        const counts = perDayDone.map(x => x.set.size);
+        const avg = counts.length ? (counts.reduce((a,b)=>a+b,0)/counts.length) : 0;
+      
+        // 全勤 / 曾完成 / 皆未完成
+        const allIds = [...nameById.keys()];
+        const fullIds = allIds.filter(uid => perDayDone.every(x => x.set.has(uid)));
+        const anyIds  = allIds.filter(uid => perDayDone.some(x => x.set.has(uid)));
+        const noneIds = allIds.filter(uid => !anyIds.includes(uid));
+      
+        // 每位成員未完成天數與日期
+        const perMemberLines = allIds.map(uid => {
+          const name = nameById.get(uid) || uid;
+          const missed = dates.filter(d => !perDayDone.find(x => x.date===d).set.has(uid));
+          const dd = missed.join(", ");
+          return `${name}：${missed.length}天${missed.length ? `（${dd}）` : ""}`;
+        }).sort((a,b)=>a.localeCompare(b,"zh-Hant"));
+      
+        const rangeTitle = `${dates[0]} ~ ${dates[dates.length-1]}`;
+        const title = `[${rangeTitle}] 定課統計`;
+      
+        // 彙整輸出（摘要 + 每日完成數 + 未全勤名單 + 各成員未完成明細）
+        const linesSummary = [
+          `總成員：${totalMembers}`,
+          `每日平均完成：${avg.toFixed(1)}`,
+          `全勤：${fullIds.length}`,
+          `曾完成：${anyIds.length}`,
+          `皆未完成：${noneIds.length}`,
+          "",
+          "每日完成數：",
+          ...perDayDone.map(x => `${x.date}：${x.set.size}`),
+          "",
+          "未全勤名單：",
+          ...fullIds.length === allIds.length ? ["（無）"] :
+            allIds.filter(uid => !fullIds.includes(uid))
+                  .map(uid => nameById.get(uid) || uid)
+                  .sort((a,b)=>a.localeCompare(b,"zh-Hant")),
+          "",
+          "各成員未完成明細：",
+          ...perMemberLines
+        ];
+      
+        const blocks = chunk([title, ...linesSummary]);
+        await reply(e.replyToken, { type:"text", text: blocks[0] });
+        if (blocks.length > 1) await push(chatId, blocks.slice(1));
+        return;
+      }
+
 
       // ===== /? 指令一覽 =====
       if (isText && isCmd(cmd, ["/?","/help","/h"])) {
         const title = `指令一覽`;
         const lines = [
-          "/reg [姓名]  登錄自己（未帶姓名則取 LINE 顯示名稱）",
-          "/d           今日完成定課",
-          "/s           今日完成/未完成清單（含統計）",
-          "/a           全部名單（已登錄者）",
-          "/? /help     顯示此說明"
+          "/reg [姓名]          登錄自己（未帶姓名則取 LINE 顯示名稱）",
+          "/d                   今日完成定課",
+          "/s                   今日完成/未完成清單（含統計）",
+          "/a                   全部名單（已登錄者）",
+          "/stats N             近 N 天統計（例：/stats 7）",
+          "/stats YYYY-MM       指定月份統計（例：/stats 2025-08），含各成員未完成天數與日期",
+          "/help             顯示此說明"
         ];
         const blocks = chunk([title, ...lines]);
         await reply(e.replyToken, { type:"text", text: blocks[0] });
         if (blocks.length>1) await push(chatId, blocks.slice(1));
         return;
       }
+
 
       // 其他訊息：不回覆
     }));
