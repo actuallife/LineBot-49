@@ -1,108 +1,106 @@
 // pages/api/webhook.js
 import getRawBody from "raw-body";
 import crypto from "crypto";
-
 export const config = { api: { bodyParser: false } };
 
-const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
-const ACCESS_TOKEN   = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+const SECRET = process.env.LINE_CHANNEL_SECRET;
+const TOKEN  = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 
-function isValidSignature(raw, signature) {
-  const mac = crypto.createHmac("sha256", CHANNEL_SECRET).update(raw).digest("base64");
-  return mac === signature;
+const ok200 = (res, body="ok") => res.status(200).send(body);
+
+function validSig(raw, sig) {
+  const mac = crypto.createHmac("sha256", SECRET).update(raw).digest("base64");
+  return mac === sig;
 }
 
-async function replyMessage(replyToken, messages) {
-  const payload = Array.isArray(messages) ? { replyToken, messages } : { replyToken, messages: [messages] };
-  await fetch("https://api.line.me/v2/bot/message/reply", {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
+async function call(endpoint, init={}) {
+  const r = await fetch(`https://api.line.me${endpoint}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+      ...(init.headers||{})
+    }
   });
+  return r;
 }
 
-async function pushMessages(to, texts) {
+async function reply(replyToken, messages) {
+  const payload = Array.isArray(messages) ? { replyToken, messages } : { replyToken, messages:[messages] };
+  await call("/v2/bot/message/reply", { method:"POST", body: JSON.stringify(payload) });
+}
+
+async function push(to, texts) {
   if (!texts.length) return;
-  await fetch("https://api.line.me/v2/bot/message/push", {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ to, messages: texts.map(t => ({ type: "text", text: t })) })
+  await call("/v2/bot/message/push", { method:"POST",
+    body: JSON.stringify({ to, messages: texts.map(t=>({type:"text",text:t})) })
   });
 }
 
-async function fetchAllMemberIds(groupId) {
-  const ids = []; let start = "";
+async function listIds(srcType, id) {
+  const base = srcType === "group" ? `/v2/bot/group/${id}` : `/v2/bot/room/${id}`;
+  const all = []; let start="";
   while (true) {
-    const url = new URL(`https://api.line.me/v2/bot/group/${groupId}/members/ids`);
-    if (start) url.searchParams.set("start", start);
-    const r = await fetch(url, { headers: { "Authorization": `Bearer ${ACCESS_TOKEN}` } });
+    const url = `${base}/members/ids${start?`?start=${encodeURIComponent(start)}`:""}`;
+    const r = await call(url, { method:"GET", headers:{ "Content-Type":undefined } });
     if (!r.ok) throw new Error(`members/ids ${r.status}`);
-    const data = await r.json();
-    ids.push(...(data.memberIds || []));
-    if (!data.next) break;
-    start = data.next;
+    const j = await r.json(); all.push(...(j.memberIds||[]));
+    if (!j.next) break; start = j.next;
   }
-  return ids;
+  return all;
 }
 
-async function fetchDisplayName(groupId, userId) {
-  const r = await fetch(`https://api.line.me/v2/bot/group/${groupId}/member/${userId}`, {
-    headers: { "Authorization": `Bearer ${ACCESS_TOKEN}` }
-  });
+async function displayName(srcType, chatId, userId) {
+  const base = srcType === "group" ? `/v2/bot/group/${chatId}` : `/v2/bot/room/${chatId}`;
+  const r = await call(`${base}/member/${userId}`, { method:"GET", headers:{ "Content-Type":undefined } });
   if (!r.ok) return null;
-  const p = await r.json();
-  return p.displayName || null;
+  const j = await r.json(); return j.displayName || null;
 }
 
-function chunkByLimit(lines, limit = 4500) {
-  const chunks = []; let buf = "";
+function chunk(lines, limit=4500) {
+  const out=[]; let buf="";
   for (const line of lines) {
-    const add = (buf ? "\n" : "") + line;
-    if ((buf + add).length > limit) { if (buf) chunks.push(buf); buf = line; } else { buf += add; }
+    const add=(buf?"\n":"")+line;
+    if ((buf+add).length>limit) { if (buf) out.push(buf); buf=line; } else { buf+=add; }
   }
-  if (buf) chunks.push(buf);
-  return chunks;
+  if (buf) out.push(buf); return out;
 }
 
 export default async function handler(req, res) {
-  // 讓 Verify/健康檢查通過
-  if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") {
-    return res.status(200).send("ok");
-  }
+  if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return ok200(res);
   if (req.method !== "POST") return res.status(405).end();
 
-  let raw;
-  try { raw = await getRawBody(req); } catch { return res.status(400).end("Bad Request"); }
+  let raw; try { raw = await getRawBody(req); } catch { return res.status(400).end("Bad Request"); }
+  const sig = req.headers["x-line-signature"] || "";
+  if (!validSig(raw, sig)) return res.status(403).end("Forbidden");
 
-  const signature = req.headers["x-line-signature"] || "";
-  if (!isValidSignature(raw, signature)) return res.status(403).end("Forbidden");
-
-  let body;
-  try { body = JSON.parse(raw.toString("utf8")); } catch { return res.status(400).end("Bad Request"); }
+  let body; try { body = JSON.parse(raw.toString("utf8")); } catch { return res.status(400).end("Bad Request"); }
 
   try {
-    await Promise.all((body.events || []).map(async (e) => {
-      if (e.type !== "message" || e.source?.type !== "group") return;
+    await Promise.all((body.events||[]).map(async (e)=>{
+      if (e.type !== "message") return;
 
-      const groupId = e.source.groupId;
-      const text = e.message?.type === "text" ? (e.message.text || "").trim() : "";
+      const srcType = e.source?.type; // "user" | "group" | "room"
+      const chatId  = e.source?.groupId || e.source?.roomId || e.source?.userId;
+      const isText  = e.message?.type === "text";
+      const text    = isText ? (e.message.text||"").trim() : "";
 
-      if (text === "/s") {
-        const memberIds = await fetchAllMemberIds(groupId);
+      // 健檢：任何文字先回一則
+      if (isText) await reply(e.replyToken, { type:"text", text:"bot online" });
+
+      if ((srcType === "group" || srcType === "room") && text === "/s") {
+        const ids = await listIds(srcType, chatId);
         const names = [];
-        for (const uid of memberIds) names.push((await fetchDisplayName(groupId, uid)) || uid);
-
-        const chunks = chunkByLimit(names);
-        if (!chunks.length) await replyMessage(e.replyToken, { type: "text", text: "沒有成員資料可顯示。" });
-        else {
-          await replyMessage(e.replyToken, { type: "text", text: chunks[0] });
-          if (chunks.length > 1) await pushMessages(groupId, chunks.slice(1));
-        }
+        for (const uid of ids) names.push((await displayName(srcType, chatId, uid)) || uid);
+        const chunks = chunk(names);
+        if (!chunks.length) return;
+        // 第一段用 reply，其餘用 push
+        await reply(e.replyToken, { type:"text", text:chunks[0] });
+        if (chunks.length > 1) await push(chatId, chunks.slice(1));
       }
     }));
   } catch (err) {
     console.error(err);
   }
-
-  res.status(200).json({ ok: true });
+  return ok200(res, JSON.stringify({ ok:true }));
 }
