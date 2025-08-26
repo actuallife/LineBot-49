@@ -199,13 +199,13 @@ export default async function handler(req, res) {
 
       // ===== /? 指令一覽 =====
       if (isText && isCmd(cmd, ["/?","/help","/h"])) {
-        const title = `[${todayKey()}] 指令一覽`;
+        const title = `指令一覽`;
         const lines = [
           "/reg  登錄自己",
           "/d    今日完成定課",
           "/s    今日完成/未完成清單（含統計）",
           "/a    全部名單（已登錄者）",
-          "/?    顯示此說明"
+          "/help    顯示此說明"
         ];
         const blocks = chunk([title, ...lines]);
         await reply(e.replyToken, { type:"text", text: blocks[0] });
