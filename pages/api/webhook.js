@@ -193,32 +193,24 @@ export default async function handler(req, res) {
         if (blocks.length > 1) await push(chatId, blocks.slice(1));
         return;
       }
-      // ===== /? 指令一覽 =====
-      if (isText && text === "/?") {
+      // /? 指令一覽
+      if (isText && isCmd(cmd, ["/?","/help","/h"])) {
         const title = `[${todayKey()}] 指令一覽`;
-        const lines = [
-          "/reg  登錄自己",
-          "/d    今日完成定課",
-          "/s    今日完成/未完成清單（含統計）",
-          "/a    全部名單（已登錄者）",
-          "/?    顯示此說明"
-        ];
-        const blocks = chunk([title, ...lines]); // 傳「行陣列」給 chunk
-        await reply(e.replyToken, {
-          type: "text",
-          text: blocks[0],
-          quickReply: {
-            items: [
-              { type:"action", action:{ type:"message", label:"/d",  text:"/d" } },
-              { type:"action", action:{ type:"message", label:"/s",  text:"/s" } },
-              { type:"action", action:{ type:"message", label:"/a",  text:"/a" } },
-              { type:"action", action:{ type:"message", label:"/reg",text:"/reg" } }
-            ]
-          }
-        });
-        if (blocks.length > 1) await push(chatId, blocks.slice(1));
+        const lines = ["/reg  登錄自己", "/d    今日完成定課", "/s    今日完成/未完成清單", "/a    全部名單（已登錄者）", "/?    顯示此說明"];
+        const blocks = chunk([title, ...lines]);
+        await reply(e.replyToken, { type:"text", text: blocks[0] });
+        if (blocks.length>1) await push(chatId, blocks.slice(1));
         return;
       }
+      
+      // /s 今日清單
+      if (isText && isCmd(cmd, ["/s","s"])) { /* 原本 /s 邏輯 */ return; }
+      
+      // /d 今日完成
+      if (isText && isCmd(cmd, ["/d","d"])) { /* 原本 /d 邏輯 */ return; }
+      
+      // /a 全部名單
+      if (isText && isCmd(cmd, ["/a","a"])) { /* 原本 /a 邏輯（用 chunk([title, ...names])） */ return; }
 
 
 
