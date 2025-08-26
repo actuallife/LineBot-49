@@ -29,7 +29,7 @@ function todayKey(tz = "Asia/Taipei") {
   const y = parts.find(p=>p.type==="year").value;
   const m = parts.find(p=>p.type==="month").value;
   const da= parts.find(p=>p.type==="day").value;
-  return `${y}-${m}-${da}`; // YYYY-MM-DD
+  return `${y}-${m}-${da}`;
 }
 function chunk(lines, limit = 4500) {
   const out=[]; let buf="";
@@ -66,7 +66,7 @@ async function membersCount(srcType, chatId) {
 }
 
 // ===== Storage: Redis 或記憶體 =====
-const mem = { members:new Map(), done:new Map() }; // members: chatId->Map<uid,name>; done: chatId->Map<date,Set<uid>>
+const mem = { members:new Map(), done:new Map() };
 async function redisExec(command) {
   if (!REDIS_URL || !REDIS_TOKEN) throw new Error("no-redis");
   const r = await fetch(REDIS_URL, { method:"POST", headers:{ Authorization:`Bearer ${REDIS_TOKEN}`, "Content-Type":"application/json" }, body: JSON.stringify({ command }) });
@@ -119,16 +119,18 @@ export default async function handler(req, res) {
       const uid     = e.source?.userId;
       const isText  = type==="message" && e.message?.type==="text";
       const rawText = isText ? (e.message.text||"") : "";
-      const cmd     = normCmd(rawText);
+      const cmd     = normCmd(rawText);               // 只用來比對指令
+      const rawNorm = toHalfWidth(rawText).trim();    // 保留原大小寫與中文字供參數解析
+      const lower   = rawNorm.toLowerCase();
 
       if (srcType!=="group" && srcType!=="room") {
-        if (isText && ["/d","/s","/a","/?","/help","/h"].includes(cmd)) {
+        if (isText && ([ "/d","/s","/a","/?","/help","/h" ].includes(cmd) || lower.startsWith("/reg"))) {
           await reply(e.replyToken,{type:"text",text:"請在群組使用指令。"});
         }
         return;
       }
 
-      // 登錄名稱：發話或加入時
+      // 發話或加入時嘗試登錄
       if (uid && (isText || type==="memberJoined")) {
         const prof = await getProfile(srcType, chatId, uid).catch(()=>null);
         if (prof) await saveMember(chatId, prof.userId, prof.displayName);
@@ -140,13 +142,21 @@ export default async function handler(req, res) {
         }
       }
 
-      // ===== /reg =====
-      if (isText && isCmd(cmd, ["/reg"])) {
-        if (uid) {
+      // ===== /reg [姓名] =====
+      if (isText && (lower === "/reg" || lower.startsWith("/reg "))) {
+        if (!uid) return;
+        // 取參數：去掉 '/reg'，保留中文字，收斂空白
+        let nameArg = rawNorm.slice(4).trim().replace(/\s+/g, " ");
+        // 限長與去除換行
+        nameArg = nameArg.replace(/[\r\n]/g, "").slice(0, 50);
+
+        let finalName = nameArg;
+        if (!finalName) {
           const p = await getProfile(srcType, chatId, uid).catch(()=>null);
-          if (p) { await saveMember(chatId, p.userId, p.displayName); await reply(e.replyToken,{type:"text",text:"已登錄。"}); }
-          else { await reply(e.replyToken,{type:"text",text:"無法取得你的資料。"}); }
+          finalName = p?.displayName || uid;
         }
+        await saveMember(chatId, uid, finalName);
+        await reply(e.replyToken,{ type:"text", text:`已登錄：${finalName}` });
         return;
       }
 
@@ -190,7 +200,7 @@ export default async function handler(req, res) {
       if (isText && isCmd(cmd, ["/a","a"])) {
         const all   = await getAllMembers(chatId);
         const names = all.map(m => m.displayName).sort((a,b)=>a.localeCompare(b,"zh-Hant"));
-        const title = `已登錄的名單（${names.length}人）`;
+        const title = `已經登錄名單（${names.length}人）`;
         const blocks = chunk([title, ...names]);
         await reply(e.replyToken, { type: "text", text: blocks[0] });
         if (blocks.length > 1) await push(chatId, blocks.slice(1));
@@ -201,11 +211,11 @@ export default async function handler(req, res) {
       if (isText && isCmd(cmd, ["/?","/help","/h"])) {
         const title = `指令一覽`;
         const lines = [
-          "/reg  登錄自己",
-          "/d    今日完成定課",
-          "/s    今日完成/未完成清單（含統計）",
-          "/a    全部名單（已登錄者）",
-          "/help    顯示此說明"
+          "/reg [姓名]  登錄自己（未帶姓名則取 LINE 顯示名稱）",
+          "/d           今日完成定課",
+          "/s           今日完成/未完成清單（含統計）",
+          "/a           全部名單（已登錄者）",
+          "/? /help     顯示此說明"
         ];
         const blocks = chunk([title, ...lines]);
         await reply(e.replyToken, { type:"text", text: blocks[0] });
