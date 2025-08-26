@@ -30,6 +30,7 @@ async function push(to, texts) {
     body: JSON.stringify({ to, messages: texts.map(t=>({ type:"text", text:t })) })
   });
 }
+// 取名單：印 403 內容
 async function listIds(srcType, chatId) {
   const base = srcType === "group" ? `/v2/bot/group/${chatId}` : `/v2/bot/room/${chatId}`;
   const all = []; let start = "";
@@ -37,17 +38,13 @@ async function listIds(srcType, chatId) {
     const path = `${base}/members/ids${start ? `?start=${encodeURIComponent(start)}` : ""}`;
     const r = await fetch(`https://api.line.me${path}`, {
       method: "GET",
-      headers: { Authorization: `Bearer ${TOKEN}` }, // 不要送 Content-Type
+      headers: { Authorization: `Bearer ${TOKEN}` } // 不要送 Content-Type
     });
     const text = await r.text();
-    if (!r.ok) {
-      console.error("members/ids failed", r.status, text); // 這行會在 Runtime Logs 顯示 LINE 的錯誤訊息
-      throw new Error(`members/ids ${r.status}`);
-    }
+    if (!r.ok) { console.error("members/ids failed", r.status, text); throw new Error(`members/ids ${r.status}`); }
     const j = JSON.parse(text);
     all.push(...(j.memberIds || []));
-    if (!j.next) break;
-    start = j.next;
+    if (!j.next) break; start = j.next;
   }
   return all;
 }
@@ -87,25 +84,32 @@ export default async function handler(req, res) {
       const isText  = e.message?.type === "text";
       const text    = isText ? (e.message.text||"").trim() : "";
 
-      // === /s：只在 group/room 執行，且不要先回 bot online（避免 replyToken 重複使用）===
+      // handler 內（/s 分支）
       if (isText && (srcType==="group" || srcType==="room") && text === "/s") {
-          // 探針：summary + count
-        const base = srcType==="group" ? `/v2/bot/group/${chatId}` : `/v2/bot/room/${chatId}`;
-        const [sumRes, cntRes] = await Promise.all([
-          fetch(`https://api.line.me${base}/summary`, { headers:{ Authorization:`Bearer ${TOKEN}` } }),
-          fetch(`https://api.line.me${base}/members/count`, { headers:{ Authorization:`Bearer ${TOKEN}` } })
-        ]);
-        console.log("probe summary", sumRes.status, "count", cntRes.status);
-        
-        const ids = await listIds(srcType, chatId);
-        const names = [];
-        for (const uid of ids) names.push((await displayName(srcType, chatId, uid)) || uid);
-
-        const chunks = chunk(names);
-        if (!chunks.length) return await reply(e.replyToken, { type:"text", text:"沒有成員資料可顯示。" });
-        await reply(e.replyToken, { type:"text", text:chunks[0] });
-        if (chunks.length > 1) await push(chatId, chunks.slice(1));
-        return; // 結束，避免再回其他訊息
+        try {
+          // 權限探針（可留可拿掉）
+          const base = srcType==="group" ? `/v2/bot/group/${chatId}` : `/v2/bot/room/${chatId}`;
+          const [sumRes, cntRes] = await Promise.all([
+            fetch(`https://api.line.me${base}/summary`, { headers:{ Authorization:`Bearer ${TOKEN}` } }),
+            fetch(`https://api.line.me${base}/members/count`, { headers:{ Authorization:`Bearer ${TOKEN}` } })
+          ]);
+          console.log("probe summary", sumRes.status, "count", cntRes.status);
+      
+          const ids = await listIds(srcType, chatId);
+          const names = [];
+          for (const uid of ids) names.push((await displayName(srcType, chatId, uid)) || uid);
+      
+          const chunks = chunk(names);
+          if (!chunks.length) await reply(e.replyToken, { type:"text", text:"沒有成員資料可顯示。" });
+          else {
+            await reply(e.replyToken, { type:"text", text: chunks[0] });
+            if (chunks.length > 1) await push(chatId, chunks.slice(1));
+          }
+        } catch (err) {
+          console.error("list members error", err);
+          await reply(e.replyToken, { type:"text", text:"名單取得失敗（可能權限或 Token 有誤）。" });
+        }
+        return;
       }
 
       // 其他文字：健康回覆
