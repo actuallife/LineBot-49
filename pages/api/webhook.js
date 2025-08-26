@@ -9,6 +9,15 @@ const TOKEN  = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL || "";
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 
+// ===== 指令正規化 =====
+function toHalfWidth(s) {
+  return String(s || "")
+    .replace(/\u3000/g, " ")
+    .replace(/[\uFF01-\uFF5E]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0));
+}
+function normCmd(s) { return toHalfWidth(s).trim().toLowerCase(); }
+function isCmd(cmd, list) { return list.includes(cmd); }
+
 // ===== Helpers =====
 function validSig(raw, sig) {
   const mac = crypto.createHmac("sha256", SECRET).update(raw).digest("base64");
@@ -56,19 +65,16 @@ async function membersCount(srcType, chatId) {
   if (!r.ok) return null; const j = await r.json(); return j.count ?? null;
 }
 
-// ===== Storage: Redis (preferred) or in-memory =====
+// ===== Storage: Redis 或記憶體 =====
 const mem = { members:new Map(), done:new Map() }; // members: chatId->Map<uid,name>; done: chatId->Map<date,Set<uid>>
 async function redisExec(command) {
   if (!REDIS_URL || !REDIS_TOKEN) throw new Error("no-redis");
-  const r = await fetch(REDIS_URL, {
-    method:"POST", headers:{ Authorization:`Bearer ${REDIS_TOKEN}`, "Content-Type":"application/json" },
-    body: JSON.stringify({ command })
-  });
+  const r = await fetch(REDIS_URL, { method:"POST", headers:{ Authorization:`Bearer ${REDIS_TOKEN}`, "Content-Type":"application/json" }, body: JSON.stringify({ command }) });
   if (!r.ok) throw new Error(`redis ${r.status}`);
-  return r.json(); // {result}
+  return r.json();
 }
-const keyMembers = (chatId)=>`group:${chatId}:members`;      // HASH uid->name
-const keyDone    = (chatId,date)=>`group:${chatId}:done:${date}`; // SET of uid
+const keyMembers = (chatId)=>`group:${chatId}:members`;             // HASH uid->name
+const keyDone    = (chatId,date)=>`group:${chatId}:done:${date}`;   // SET of uid
 
 async function saveMember(chatId, uid, name) {
   try { await redisExec(["HSET", keyMembers(chatId), uid, name]); }
@@ -112,14 +118,17 @@ export default async function handler(req, res) {
       const chatId  = e.source?.groupId || e.source?.roomId;
       const uid     = e.source?.userId;
       const isText  = type==="message" && e.message?.type==="text";
-      const text    = isText ? (e.message.text||"").trim() : "";
+      const rawText = isText ? (e.message.text||"") : "";
+      const cmd     = normCmd(rawText);
 
       if (srcType!=="group" && srcType!=="room") {
-        if (isText && (text==="/d" || text==="/s")) await reply(e.replyToken,{type:"text",text:"請在群組使用指令。"});
+        if (isText && ["/d","/s","/a","/?","/help","/h"].includes(cmd)) {
+          await reply(e.replyToken,{type:"text",text:"請在群組使用指令。"});
+        }
         return;
       }
 
-      // 每次發話/加入都嘗試登錄名稱
+      // 登錄名稱：發話或加入時
       if (uid && (isText || type==="memberJoined")) {
         const prof = await getProfile(srcType, chatId, uid).catch(()=>null);
         if (prof) await saveMember(chatId, prof.userId, prof.displayName);
@@ -130,30 +139,31 @@ export default async function handler(req, res) {
           if (p) await saveMember(chatId, p.userId, p.displayName);
         }
       }
-      if (type==="memberLeft" && Array.isArray(e.left?.members)) {
-        // 可選：不強制刪除，保留名單以便統計
-      }
 
-      // ===== /reg 登錄自己 =====
-      if (isText && text==="/reg" && uid) {
-        const p = await getProfile(srcType, chatId, uid).catch(()=>null);
-        if (p) { await saveMember(chatId, p.userId, p.displayName); await reply(e.replyToken,{type:"text",text:"已登錄。"}); }
-        else { await reply(e.replyToken,{type:"text",text:"無法取得你的資料。"}); }
+      // ===== /reg =====
+      if (isText && isCmd(cmd, ["/reg"])) {
+        if (uid) {
+          const p = await getProfile(srcType, chatId, uid).catch(()=>null);
+          if (p) { await saveMember(chatId, p.userId, p.displayName); await reply(e.replyToken,{type:"text",text:"已登錄。"}); }
+          else { await reply(e.replyToken,{type:"text",text:"無法取得你的資料。"}); }
+        }
         return;
       }
 
       // ===== /d 今日完成 =====
-      if (isText && text==="/d" && uid) {
-        const date = todayKey();
-        const p = await getProfile(srcType, chatId, uid).catch(()=>null);
-        if (p) await saveMember(chatId, p.userId, p.displayName);
-        await markDone(chatId, date, uid);
-        await reply(e.replyToken, { type:"text", text:`已記錄：${date}` });
+      if (isText && isCmd(cmd, ["/d","d"])) {
+        if (uid) {
+          const date = todayKey();
+          const p = await getProfile(srcType, chatId, uid).catch(()=>null);
+          if (p) await saveMember(chatId, p.userId, p.displayName);
+          await markDone(chatId, date, uid);
+          await reply(e.replyToken, { type:"text", text:`已記錄：${date}` });
+        }
         return;
       }
 
-      // ===== /s 狀態清單 =====
-      if (isText && text==="/s") {
+      // ===== /s 今日清單 =====
+      if (isText && isCmd(cmd, ["/s","s"])) {
         const date = todayKey();
         const [all, doneUids, totalCnt] = await Promise.all([
           getAllMembers(chatId),
@@ -161,58 +171,47 @@ export default async function handler(req, res) {
           membersCount(srcType, chatId)
         ]);
         const nameById = new Map(all.map(m=>[m.userId, m.displayName]));
-        const done = []; const undone = [];
-        // 以已知名單為基準
-        for (const [id, name] of nameById.entries()) {
-          (doneUids.includes(id) ? done : undone).push(name || id);
-        }
+        const done = [], undone = [];
+        for (const [id, name] of nameById.entries()) (doneUids.includes(id) ? done : undone).push(name || id);
         done.sort((a,b)=>a.localeCompare(b,"zh-Hant"));
         undone.sort((a,b)=>a.localeCompare(b,"zh-Hant"));
 
         const title = `[${date}] 定課狀態：已完成 ${done.length}/${totalCnt ?? (done.length+undone.length)}`;
-        const blocks = [];
-        blocks.push(`${title}\n— 已完成（${done.length}）\n${done.length?done.join("\n"):"（無）"}`);
-        blocks.push(`— 未完成（${undone.length}）\n${undone.length?undone.join("\n"):"（無）"}`);
-
         const parts = [];
-        for (const b of blocks) parts.push(...chunk(b.split("\n")));
+        parts.push(...chunk([title, `— 已完成（${done.length}）`, ...(done.length?done:["（無）"]) ]));
+        parts.push(...chunk([`— 未完成（${undone.length}）`, ...(undone.length?undone:["（無）"]) ]));
 
         await reply(e.replyToken, { type:"text", text: parts[0] });
         if (parts.length>1) await push(chatId, parts.slice(1));
         return;
       }
+
       // ===== /a 全部名單 =====
-      if (isText && text === "/a") {
+      if (isText && isCmd(cmd, ["/a","a"])) {
         const all   = await getAllMembers(chatId);
         const names = all.map(m => m.displayName).sort((a,b)=>a.localeCompare(b,"zh-Hant"));
-      
         const title = `[${todayKey()}] 全部名單（${names.length}人）`;
-        const blocks = chunk([title, ...names]);  // ← 不要 join("\n")
-      
+        const blocks = chunk([title, ...names]);
         await reply(e.replyToken, { type: "text", text: blocks[0] });
         if (blocks.length > 1) await push(chatId, blocks.slice(1));
         return;
       }
-      // /? 指令一覽
+
+      // ===== /? 指令一覽 =====
       if (isText && isCmd(cmd, ["/?","/help","/h"])) {
         const title = `[${todayKey()}] 指令一覽`;
-        const lines = ["/reg  登錄自己", "/d    今日完成定課", "/s    今日完成/未完成清單", "/a    全部名單（已登錄者）", "/?    顯示此說明"];
+        const lines = [
+          "/reg  登錄自己",
+          "/d    今日完成定課",
+          "/s    今日完成/未完成清單（含統計）",
+          "/a    全部名單（已登錄者）",
+          "/?    顯示此說明"
+        ];
         const blocks = chunk([title, ...lines]);
         await reply(e.replyToken, { type:"text", text: blocks[0] });
         if (blocks.length>1) await push(chatId, blocks.slice(1));
         return;
       }
-      
-      // /s 今日清單
-      if (isText && isCmd(cmd, ["/s","s"])) { /* 原本 /s 邏輯 */ return; }
-      
-      // /d 今日完成
-      if (isText && isCmd(cmd, ["/d","d"])) { /* 原本 /d 邏輯 */ return; }
-      
-      // /a 全部名單
-      if (isText && isCmd(cmd, ["/a","a"])) { /* 原本 /a 邏輯（用 chunk([title, ...names])） */ return; }
-
-
 
       // 其他訊息：不回覆
     }));
