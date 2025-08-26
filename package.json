@@ -1,0 +1,14 @@
+{
+  "name": "line-bot-vercel",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000"
+  },
+  "dependencies": {
+    "next": "^14",
+    "raw-body": "^2"
+  }
+}
