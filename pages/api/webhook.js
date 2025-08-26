@@ -183,15 +183,17 @@ export default async function handler(req, res) {
       }
       // ===== /a 全部名單 =====
       if (isText && text === "/a") {
-        const all = await getAllMembers(chatId);                 // 來自 Redis 或記憶體
-        const names = all.map(m => m.displayName)
-                         .sort((a,b)=>a.localeCompare(b,"zh-Hant"));
+        const all   = await getAllMembers(chatId);
+        const names = all.map(m => m.displayName).sort((a,b)=>a.localeCompare(b,"zh-Hant"));
+      
         const title = `[${todayKey()}] 全部名單（${names.length}人）`;
-        const blocks = chunk([title, ...names].join("\n"));      // 依 4500 字分段
-        await reply(e.replyToken, { type:"text", text: blocks[0] });
+        const blocks = chunk([title, ...names]);  // ← 不要 join("\n")
+      
+        await reply(e.replyToken, { type: "text", text: blocks[0] });
         if (blocks.length > 1) await push(chatId, blocks.slice(1));
         return;
       }
+
 
 
       // 其他訊息：不回覆
